@@ -1,6 +1,6 @@
 {
   "name": "@zhzy0077/opencode-copilot-cli-auth",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "main": "./index.mjs",
   "publishConfig": {
     "access": "public"

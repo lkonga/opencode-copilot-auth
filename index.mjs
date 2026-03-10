@@ -62,7 +62,7 @@ export async function CopilotAuthPlugin() {
         Authorization: `Bearer ${info.refresh}`,
         "Copilot-Integration-Id": "copilot-developer-cli",
         "Openai-Intent": "model-access",
-        "User-Agent": "opencode-copilot-cli-auth/0.0.15",
+        "User-Agent": "opencode-copilot-cli-auth/0.0.16",
         "X-GitHub-Api-Version": API_VERSION,
         "X-Interaction-Type": "model-access",
         "X-Request-Id": crypto.randomUUID(),
@@ -229,7 +229,7 @@ export async function CopilotAuthPlugin() {
       Authorization: `Bearer ${info.refresh}`,
       "Copilot-Integration-Id": "copilot-developer-cli",
       "Openai-Intent": "conversation-agent",
-      "User-Agent": "opencode-copilot-cli-auth/0.0.15",
+      "User-Agent": "opencode-copilot-cli-auth/0.0.16",
       "X-GitHub-Api-Version": API_VERSION,
       "X-Initiator": isAgent ? "agent" : "user",
       "X-Interaction-Id": crypto.randomUUID(),
@@ -355,7 +355,7 @@ export async function CopilotAuthPlugin() {
               headers: {
                 Accept: "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "opencode-copilot-cli-auth/0.0.15",
+                "User-Agent": "opencode-copilot-cli-auth/0.0.16",
               },
               body: JSON.stringify({
                 client_id: CLIENT_ID,
@@ -380,7 +380,7 @@ export async function CopilotAuthPlugin() {
                     headers: {
                       Accept: "application/json",
                       "Content-Type": "application/json",
-                      "User-Agent": "opencode-copilot-cli-auth/0.0.15",
+                      "User-Agent": "opencode-copilot-cli-auth/0.0.16",
                     },
                     body: JSON.stringify({
                       client_id: CLIENT_ID,
