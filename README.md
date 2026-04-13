@@ -12,7 +12,7 @@ Add the plugin to your `opencode` config:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@zhzy0077/opencode-copilot-cli-auth@0.0.16"
+    "@zhzy0077/opencode-copilot-cli-auth@0.0.18"
   ]
 }
 ```
@@ -38,7 +38,7 @@ Important: if the file path contains `opencode-copilot-auth`, current `opencode`
 - Entitlement: fetches `/copilot_internal/user` and uses the entitlement-provided Copilot API base URL.
 - Token exchange: does not call `/copilot_internal/v2/token`.
 - Request profile: uses the newer `copilot-developer-cli` headers instead of the older chat profile.
-- Model metadata: fetches the live Copilot `/models` response during auth loading and patches the in-memory `opencode` provider model objects.
+- Model metadata: fetches the live Copilot `/models` response via the plugin `provider.models` hook so the final `opencode` model list comes from the entitlement-backed Copilot API.
 
 ## Context window and model limits
 

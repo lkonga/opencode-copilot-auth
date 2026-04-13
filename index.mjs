@@ -56,6 +56,12 @@ export async function CopilotAuthPlugin() {
     return response.json();
   }
 
+  async function getBaseURL(info) {
+    if (info.baseUrl) return info.baseUrl;
+    const entitlement = await fetchEntitlement(info);
+    return entitlement?.endpoints?.api;
+  }
+
   async function fetchModels(info, baseURL) {
     const response = await fetch(`${baseURL}/models`, {
       headers: {
@@ -77,110 +83,140 @@ export async function CopilotAuthPlugin() {
     return Array.isArray(data?.data) ? data.data : [];
   }
 
-  function patchProviderModels(provider, liveModels) {
-    if (!provider?.models) return;
+  function zeroCost() {
+    return {
+      input: 0,
+      output: 0,
+      cache: {
+        read: 0,
+        write: 0,
+      },
+    };
+  }
 
-    const liveById = new Map(liveModels.map((model) => [model.id, model]));
-    const opus4_6 = provider.models["claude-opus-4.6"];
-    const opus4_6_1m = liveById.get("claude-opus-4.6-1m");
+  function isLiveChatModel(model) {
+    return model?.capabilities?.type === "chat";
+  }
 
-    if (opus4_6 && opus4_6_1m && !provider.models["claude-opus-4.6-1m"]) {
-      const limits = opus4_6_1m.capabilities?.limits ?? {};
-      const supports = opus4_6_1m.capabilities?.supports ?? {};
-      const vision = !!supports.vision || !!limits.vision;
+  function isPickerModel(model) {
+    return isLiveChatModel(model) && model?.model_picker_enabled !== false;
+  }
 
-      provider.models["claude-opus-4.6-1m"] = {
-        ...structuredClone(opus4_6),
-        id: "claude-opus-4.6-1m",
-        api: {
-          ...opus4_6.api,
-          id: "claude-opus-4.6-1m",
-        },
-        name: "Claude Opus 4.6 (1M context)",
-        family: opus4_6_1m.capabilities?.family ?? opus4_6.family,
-        cost: {
-          input: 0,
-          output: 0,
-          cache: {
-            read: 0,
-            write: 0,
-          },
-        },
-        limit: {
-          context:
-            limits.max_context_window_tokens
-            ?? opus4_6.limit.context,
-          input:
-            limits.max_prompt_tokens
-            ?? opus4_6.limit.input
-            ?? limits.max_context_window_tokens,
-          output:
-            limits.max_output_tokens
-            ?? limits.max_non_streaming_output_tokens
-            ?? opus4_6.limit.output,
-        },
-        capabilities: {
-          ...structuredClone(opus4_6.capabilities),
-          reasoning:
-            opus4_6.capabilities.reasoning
-            || !!supports.adaptive_thinking
-            || typeof supports.max_thinking_budget === "number"
-            || Array.isArray(supports.reasoning_effort),
-          attachment: opus4_6.capabilities.attachment || vision,
-          toolcall:
-            opus4_6.capabilities.toolcall || !!supports.tool_calls,
-          input: {
-            ...structuredClone(opus4_6.capabilities.input),
-            image: opus4_6.capabilities.input.image || vision,
-          },
-        },
-      };
+  function getReleaseDate(id, version, fallback = "") {
+    if (typeof version === "string" && version.startsWith(`${id}-`)) {
+      return version.slice(id.length + 1);
     }
+    return version || fallback;
+  }
 
-    for (const model of Object.values(provider.models)) {
-      model.cost = {
-        input: 0,
-        output: 0,
-        cache: {
-          read: 0,
-          write: 0,
-        },
-      };
-      model.api.npm = "@ai-sdk/github-copilot";
-
-      const live = liveById.get(model.id);
-      if (!live) continue;
-
-      const limits = live.capabilities?.limits ?? {};
-      const supports = live.capabilities?.supports ?? {};
-      const vision = !!supports.vision || !!limits.vision;
-
-      model.limit.context =
-        limits.max_context_window_tokens
-        ?? model.limit.context;
-      model.limit.input =
-        limits.max_prompt_tokens
-        ?? model.limit.input
-        ?? limits.max_context_window_tokens;
-      model.limit.output =
-        limits.max_output_tokens
-        ?? limits.max_non_streaming_output_tokens
-        ?? model.limit.output;
-
-      model.capabilities.reasoning =
-        model.capabilities.reasoning
-        || !!supports.adaptive_thinking
+  function createProviderModel(existing, live, baseURL) {
+    const limits = live.capabilities?.limits ?? {};
+    const supports = live.capabilities?.supports ?? {};
+    const vision = !!supports.vision || !!limits.vision;
+    const reasoning =
+      existing?.capabilities?.reasoning
+      ?? (
+        !!supports.adaptive_thinking
         || typeof supports.max_thinking_budget === "number"
-        || Array.isArray(supports.reasoning_effort);
-      model.capabilities.attachment = model.capabilities.attachment || vision;
-      model.capabilities.toolcall =
-        model.capabilities.toolcall || !!supports.tool_calls;
+        || Array.isArray(supports.reasoning_effort)
+      );
 
-      if (vision) {
-        model.capabilities.input.image = true;
-      }
+    return {
+      ...structuredClone(existing ?? {}),
+      id: live.id,
+      api: {
+        ...(existing?.api ?? {}),
+        id: live.id,
+        url: baseURL,
+        npm: "@ai-sdk/github-copilot",
+      },
+      name: live.name ?? existing?.name ?? live.id,
+      family: live.capabilities?.family ?? existing?.family ?? "",
+      cost: zeroCost(),
+      limit: {
+        context:
+          limits.max_context_window_tokens
+          ?? existing?.limit?.context
+          ?? 0,
+        input:
+          limits.max_prompt_tokens
+          ?? existing?.limit?.input
+          ?? limits.max_context_window_tokens,
+        output:
+          limits.max_output_tokens
+          ?? limits.max_non_streaming_output_tokens
+          ?? existing?.limit?.output
+          ?? 0,
+      },
+      capabilities: {
+        temperature: existing?.capabilities?.temperature ?? true,
+        reasoning,
+        attachment: existing?.capabilities?.attachment ?? vision,
+        toolcall: !!supports.tool_calls,
+        input: {
+          text: existing?.capabilities?.input?.text ?? true,
+          audio: existing?.capabilities?.input?.audio ?? false,
+          image: existing?.capabilities?.input?.image ?? vision,
+          video: existing?.capabilities?.input?.video ?? false,
+          pdf: existing?.capabilities?.input?.pdf ?? false,
+        },
+        output: {
+          text: existing?.capabilities?.output?.text ?? true,
+          audio: existing?.capabilities?.output?.audio ?? false,
+          image: existing?.capabilities?.output?.image ?? false,
+          video: existing?.capabilities?.output?.video ?? false,
+          pdf: existing?.capabilities?.output?.pdf ?? false,
+        },
+        interleaved: existing?.capabilities?.interleaved ?? false,
+      },
+      options: existing?.options ?? {},
+      headers: existing?.headers ?? {},
+      release_date: getReleaseDate(live.id, live.version, existing?.release_date ?? ""),
+      variants: existing?.variants ?? {},
+      status: "active",
+    };
+  }
 
+  function buildProviderModels(existingModels, liveModels, baseURL) {
+    const existingById = new Map(
+      Object.values(existingModels ?? {}).map((model) => [model?.api?.id ?? model?.id, model]),
+    );
+
+    return Object.fromEntries(
+      liveModels
+        .filter(isPickerModel)
+        .map((model) => [
+          model.id,
+          createProviderModel(existingById.get(model.id), model, baseURL),
+        ]),
+    );
+  }
+
+  function normalizeExistingModels(existingModels, baseURL) {
+    return Object.fromEntries(
+      Object.entries(existingModels ?? {}).map(([id, model]) => [
+        id,
+        {
+          ...structuredClone(model),
+          cost: zeroCost(),
+          api: {
+            ...model.api,
+            url: baseURL ?? model.api?.url,
+            npm: "@ai-sdk/github-copilot",
+          },
+        },
+      ]),
+    );
+  }
+
+  async function resolveProviderModels(existingModels, auth) {
+    const baseURL = auth ? await getBaseURL(auth) : undefined;
+    if (!auth || auth.type !== "oauth" || !baseURL) {
+      return normalizeExistingModels(existingModels, baseURL);
     }
+
+    const liveModels = await fetchModels(auth, baseURL);
+    return buildProviderModels(existingModels, liveModels, baseURL);
   }
 
   function getConversationMetadata(init) {
@@ -253,26 +289,24 @@ export async function CopilotAuthPlugin() {
   }
 
   return {
+    provider: {
+      id: "github-copilot",
+      models: async (provider, ctx) => {
+        try {
+          return await resolveProviderModels(provider.models, ctx.auth);
+        } catch (error) {
+          console.warn("[opencode-copilot-cli-auth] Failed to sync live Copilot models.", error);
+          return normalizeExistingModels(provider.models);
+        }
+      },
+    },
     auth: {
       provider: "github-copilot",
-      loader: async (getAuth, provider) => {
+      loader: async (getAuth) => {
         const info = await getAuth();
         if (!info || info.type !== "oauth") return {};
 
-        let baseURL = info.baseUrl;
-        if (!baseURL) {
-          const entitlement = await fetchEntitlement(info);
-          baseURL = entitlement?.endpoints?.api;
-        }
-
-        if (baseURL) {
-          try {
-            const liveModels = await fetchModels(info, baseURL);
-            patchProviderModels(provider, liveModels);
-          } catch {}
-        } else {
-          patchProviderModels(provider, []);
-        }
+        const baseURL = await getBaseURL(info);
 
         return {
           ...(baseURL && { baseURL }),
