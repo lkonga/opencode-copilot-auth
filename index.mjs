@@ -1,7 +1,7 @@
 /**
  * @type {import("@opencode-ai/plugin").Plugin}
  */
-export async function CopilotAuthPlugin() {
+export async function CopilotAuthPlugin(input = {}) {
   const CLIENT_ID = "Ov23ctDVkRmgkPke0Mmm";
   const API_VERSION = "2025-05-01";
   const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000;
@@ -219,6 +219,28 @@ export async function CopilotAuthPlugin() {
     return buildProviderModels(existingModels, liveModels, baseURL);
   }
 
+  function getHeader(headers, name) {
+    if (!headers) return undefined;
+    const target = name.toLowerCase();
+
+    if (typeof Headers !== "undefined" && headers instanceof Headers) {
+      return headers.get(name) ?? headers.get(target) ?? undefined;
+    }
+
+    if (Array.isArray(headers)) {
+      const found = headers.find(([key]) => String(key).toLowerCase() === target);
+      return found?.[1];
+    }
+
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() === target) {
+        return value;
+      }
+    }
+
+    return undefined;
+  }
+
   function getConversationMetadata(init) {
     try {
       const body = typeof init?.body === "string" ? JSON.parse(init.body) : init?.body;
@@ -260,6 +282,7 @@ export async function CopilotAuthPlugin() {
   }
 
   function buildHeaders(init, info, isVision, isAgent) {
+    const explicitInitiator = getHeader(init?.headers, "x-initiator");
     const headers = {
       ...(init?.headers ?? {}),
       Authorization: `Bearer ${info.refresh}`,
@@ -267,7 +290,7 @@ export async function CopilotAuthPlugin() {
       "Openai-Intent": "conversation-agent",
       "User-Agent": "opencode-copilot-cli-auth/0.0.16",
       "X-GitHub-Api-Version": API_VERSION,
-      "X-Initiator": isAgent ? "agent" : "user",
+      "X-Initiator": explicitInitiator ?? (isAgent ? "agent" : "user"),
       "X-Interaction-Id": crypto.randomUUID(),
       "X-Interaction-Type": "conversation-agent",
       "X-Request-Id": crypto.randomUUID(),
@@ -279,6 +302,7 @@ export async function CopilotAuthPlugin() {
 
     delete headers["x-api-key"];
     delete headers["authorization"];
+    delete headers["x-initiator"];
 
     return headers;
   }
@@ -503,6 +527,46 @@ export async function CopilotAuthPlugin() {
       if (thinkingBudget === undefined) return;
 
       output.options.thinking_budget = thinkingBudget;
+    },
+    "chat.headers": async (incoming, output) => {
+      if (!incoming.model.providerID.includes("github-copilot")) return;
+
+      const sdk = input.client;
+      if (!sdk?.session?.message || !sdk?.session?.get) return;
+
+      const parts = await sdk.session
+        .message({
+          path: {
+            id: incoming.message.sessionID,
+            messageID: incoming.message.id,
+          },
+          query: {
+            directory: input.directory,
+          },
+          throwOnError: true,
+        })
+        .catch(() => undefined);
+
+      if (parts?.data?.parts?.some((part) => part.type === "compaction")) {
+        output.headers["x-initiator"] = "agent";
+        return;
+      }
+
+      const session = await sdk.session
+        .get({
+          path: {
+            id: incoming.sessionID,
+          },
+          query: {
+            directory: input.directory,
+          },
+          throwOnError: true,
+        })
+        .catch(() => undefined);
+
+      if (!session?.data?.parentID) return;
+
+      output.headers["x-initiator"] = "agent";
     },
   };
 }
