@@ -2,10 +2,10 @@
  * @type {import("@opencode-ai/plugin").Plugin}
  */
 export async function CopilotAuthPlugin(input = {}) {
-  const CLIENT_ID = "Ov23ctDVkRmgkPke0Mmm";
+  const CLIENT_ID = "Iv1.b507a08c87ecfe98";
   const API_VERSION = "2025-05-01";
   const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000;
-  const OAUTH_SCOPES = "read:user read:org repo gist";
+  const OAUTH_SCOPES = "read:user";
   const RESPONSES_API_ALTERNATE_INPUT_TYPES = [
     "file_search_call",
     "computer_call",
@@ -28,6 +28,18 @@ export async function CopilotAuthPlugin(input = {}) {
   // Replaced (not accumulated) on each fetchModels() call so stale data doesn't persist.
   let messagesEndpointModels = new Set();
 
+  const VSCODE_HEADERS = {
+    "User-Agent": "GitHubCopilotChat/0.38.0",
+    "Editor-Version": "vscode/1.110.1",
+    "Editor-Plugin-Version": "copilot-chat/0.38.0",
+    "Copilot-Integration-Id": "vscode-chat",
+  };
+
+  // Short-lived Copilot token cache (expires every ~30 min)
+  let _copilotToken = null;
+  let _copilotTokenExpiry = 0;
+  let _copilotTokenSource = null;
+
   function normalizeDomain(url) {
     return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
   }
@@ -49,7 +61,7 @@ export async function CopilotAuthPlugin(input = {}) {
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${info.refresh}`,
-        "User-Agent": "GithubCopilot/1.155.0",
+        ...VSCODE_HEADERS,
       },
     });
 
@@ -62,17 +74,47 @@ export async function CopilotAuthPlugin(input = {}) {
 
   async function getBaseURL(info) {
     if (info.baseUrl) return info.baseUrl;
-    const entitlement = await fetchEntitlement(info);
-    return entitlement?.endpoints?.api;
+    if (info.enterpriseUrl) {
+      const entitlement = await fetchEntitlement(info);
+      return entitlement?.endpoints?.api;
+    }
+    return "https://api.githubcopilot.com";
   }
 
-  async function fetchModels(info, baseURL) {
+  async function getCopilotToken(info) {
+    const now = Date.now();
+    if (_copilotToken && _copilotTokenSource === info.refresh && _copilotTokenExpiry > now + 60_000) {
+      return _copilotToken;
+    }
+
+    const domain = info.enterpriseUrl ? normalizeDomain(info.enterpriseUrl) : "github.com";
+    const apiDomain = domain === "github.com" ? "api.github.com" : `api.${domain}`;
+
+    const response = await fetch(`https://${apiDomain}/copilot_internal/v2/token`, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${info.refresh}`,
+        ...VSCODE_HEADERS,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Copilot token exchange failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+    _copilotToken = data.token;
+    _copilotTokenExpiry = (data.expires_at ?? 0) * 1000;
+    _copilotTokenSource = info.refresh;
+    return _copilotToken;
+  }
+
+  async function fetchModels(copilotToken, baseURL) {
     const response = await fetch(`${baseURL}/models`, {
       headers: {
-        Authorization: `Bearer ${info.refresh}`,
-        "Copilot-Integration-Id": "copilot-developer-cli",
+        Authorization: `Bearer ${copilotToken}`,
+        ...VSCODE_HEADERS,
         "Openai-Intent": "model-access",
-        "User-Agent": "opencode-copilot-cli-auth/0.0.16",
         "X-GitHub-Api-Version": API_VERSION,
         "X-Interaction-Type": "model-access",
         "X-Request-Id": crypto.randomUUID(),
@@ -228,7 +270,8 @@ export async function CopilotAuthPlugin(input = {}) {
       return normalizeExistingModels(existingModels, baseURL);
     }
 
-    const liveModels = await fetchModels(auth, baseURL);
+    const copilotToken = await getCopilotToken(auth);
+    const liveModels = await fetchModels(copilotToken, baseURL);
     return buildProviderModels(existingModels, liveModels, baseURL);
   }
 
@@ -294,14 +337,13 @@ export async function CopilotAuthPlugin(input = {}) {
     };
   }
 
-  function buildHeaders(init, info, isVision, isAgent) {
+  function buildHeaders(init, copilotToken, isVision, isAgent) {
     const explicitInitiator = getHeader(init?.headers, "x-initiator");
     const headers = {
       ...(init?.headers ?? {}),
-      Authorization: `Bearer ${info.refresh}`,
-      "Copilot-Integration-Id": "copilot-developer-cli",
+      Authorization: `Bearer ${copilotToken}`,
+      ...VSCODE_HEADERS,
       "Openai-Intent": "conversation-agent",
-      "User-Agent": "opencode-copilot-cli-auth/0.0.16",
       "X-GitHub-Api-Version": API_VERSION,
       "X-Initiator": explicitInitiator ?? (isAgent ? "agent" : "user"),
       "X-Interaction-Id": crypto.randomUUID(),
@@ -680,8 +722,9 @@ export async function CopilotAuthPlugin(input = {}) {
               return fetch(input, init);
             }
 
+            const copilotToken = await getCopilotToken(auth);
             const { isVision, isAgent } = getConversationMetadata(init);
-            const headers = buildHeaders(init, auth, isVision, isAgent);
+            const headers = buildHeaders(init, copilotToken, isVision, isAgent);
 
             // Route Claude models with /v1/messages support to the native Anthropic endpoint
             const url = input instanceof Request ? input.url : String(input);
@@ -706,7 +749,7 @@ export async function CopilotAuthPlugin(input = {}) {
       methods: [
         {
           type: "oauth",
-          label: "Login with GitHub Copilot CLI",
+          label: "Login with GitHub Copilot",
           prompts: [
             {
               type: "select",
@@ -765,7 +808,7 @@ export async function CopilotAuthPlugin(input = {}) {
               headers: {
                 Accept: "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "opencode-copilot-cli-auth/0.0.16",
+                ...VSCODE_HEADERS,
               },
               body: JSON.stringify({
                 client_id: CLIENT_ID,
@@ -790,7 +833,7 @@ export async function CopilotAuthPlugin(input = {}) {
                     headers: {
                       Accept: "application/json",
                       "Content-Type": "application/json",
-                      "User-Agent": "opencode-copilot-cli-auth/0.0.16",
+                      ...VSCODE_HEADERS,
                     },
                     body: JSON.stringify({
                       client_id: CLIENT_ID,
@@ -805,25 +848,21 @@ export async function CopilotAuthPlugin(input = {}) {
                   const data = await response.json();
 
                   if (data.access_token) {
-                    const entitlement = await fetchEntitlement({
-                      refresh: data.access_token,
-                      enterpriseUrl:
-                        actualProvider === "github-copilot-enterprise"
-                          ? domain
-                          : undefined,
-                    });
-
                     const result = {
                       type: "success",
                       refresh: data.access_token,
                       access: data.access_token,
                       expires: 0,
-                      baseUrl: entitlement?.endpoints?.api,
                     };
 
                     if (actualProvider === "github-copilot-enterprise") {
+                      const entitlement = await fetchEntitlement({
+                        refresh: data.access_token,
+                        enterpriseUrl: domain,
+                      });
                       result.provider = "github-copilot-enterprise";
                       result.enterpriseUrl = domain;
+                      result.baseUrl = entitlement?.endpoints?.api;
                     }
 
                     return result;
@@ -883,7 +922,7 @@ export async function CopilotAuthPlugin(input = {}) {
     "chat.headers": async (incoming, output) => {
       if (!incoming.model.providerID.includes("github-copilot")) return;
 
-      const sdk = input.client;
+      const sdk = incoming.client;
       if (!sdk?.session?.message || !sdk?.session?.get) return;
 
       const parts = await sdk.session
