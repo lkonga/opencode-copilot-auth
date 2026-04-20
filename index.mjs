@@ -40,10 +40,6 @@ export async function CopilotAuthPlugin({ client } = {}) {
   let _cachedToken = null;
   let _cachedTokenExpiry = 0;
 
-  // chat.params doesn't expose variant, so we capture it in chat.message (which fires
-  // first) and look it up by messageID when chat.params runs.
-  const _variantByMessageId = new Map();
-
   function normalizeDomain(url) {
     return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
   }
@@ -390,11 +386,6 @@ export async function CopilotAuthPlugin({ client } = {}) {
     return headers;
   }
 
-  function resolveClaudeThinkingBudget(model, variant) {
-    if (!model?.id?.includes("claude")) return undefined;
-    return variant === "thinking" ? 16000 : undefined;
-  }
-
   // ---------------------------------------------------------------------------
   // OpenAI ↔ Anthropic translation for /v1/messages routing
   // ---------------------------------------------------------------------------
@@ -432,8 +423,17 @@ export async function CopilotAuthPlugin({ client } = {}) {
     if (body.stop) {
       result.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
     }
-    if (body.thinking_budget) {
+
+    // reasoning_effort comes from the @ai-sdk/github-copilot reasoningEffort variant option
+    const REASONING_EFFORT_BUDGETS = { low: 4000, medium: 8000, high: 16000 };
+    const effortBudget = REASONING_EFFORT_BUDGETS[body.reasoning_effort];
+    if (effortBudget !== undefined) {
+      result.thinking = { type: "enabled", budget_tokens: effortBudget };
+      // Anthropic requires temperature=1 when thinking is enabled
+      result.temperature = 1;
+    } else if (body.thinking_budget) {
       result.thinking = { type: "enabled", budget_tokens: body.thinking_budget };
+      result.temperature = 1;
     }
 
     const msgs = body.messages ?? [];
@@ -936,24 +936,6 @@ export async function CopilotAuthPlugin({ client } = {}) {
           },
         },
       ],
-    },
-    "chat.message": async (input) => {
-      if (input.messageID && input.variant) {
-        _variantByMessageId.set(input.messageID, input.variant);
-      }
-    },
-    "chat.params": async (input, output) => {
-      if (input.model.providerID !== "github-copilot") return;
-      if (input.model.api?.npm !== "@ai-sdk/github-copilot") return;
-      if (!input.model.id.includes("claude")) return;
-
-      const variant = _variantByMessageId.get(input.message.id);
-      _variantByMessageId.delete(input.message.id);
-
-      const thinkingBudget = resolveClaudeThinkingBudget(input.model, variant);
-      if (thinkingBudget === undefined) return;
-
-      output.options.thinking_budget = thinkingBudget;
     },
     "chat.headers": async (incoming, output) => {
       if (!incoming.model.providerID.includes("github-copilot")) return;
