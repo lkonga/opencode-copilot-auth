@@ -24,6 +24,10 @@ export async function CopilotAuthPlugin(input = {}) {
     "reasoning",
   ];
 
+  // Models that support the native Anthropic Messages API endpoint (/v1/messages).
+  // Replaced (not accumulated) on each fetchModels() call so stale data doesn't persist.
+  let messagesEndpointModels = new Set();
+
   function normalizeDomain(url) {
     return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
   }
@@ -80,7 +84,16 @@ export async function CopilotAuthPlugin(input = {}) {
     }
 
     const data = await response.json();
-    return Array.isArray(data?.data) ? data.data : [];
+    const models = Array.isArray(data?.data) ? data.data : [];
+
+    // Replace (not accumulate) so stale capabilities don't persist across re-fetches
+    messagesEndpointModels = new Set(
+      models
+        .filter((m) => m.supported_endpoints?.includes("/v1/messages"))
+        .map((m) => m.id),
+    );
+
+    return models;
   }
 
   function zeroCost() {
@@ -312,6 +325,332 @@ export async function CopilotAuthPlugin(input = {}) {
     return variant === "thinking" ? 16000 : undefined;
   }
 
+  // ---------------------------------------------------------------------------
+  // OpenAI ↔ Anthropic translation for /v1/messages routing
+  // ---------------------------------------------------------------------------
+
+  function convertContentToAnthropic(content) {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return content ?? "";
+    return content.map((part) => {
+      if (part.type === "text") return { type: "text", text: part.text };
+      if (part.type === "image_url") {
+        const url = part.image_url?.url ?? "";
+        if (url.startsWith("data:")) {
+          const match = url.match(/^data:([^;]+);base64,(.+)$/);
+          if (match) {
+            return {
+              type: "image",
+              source: { type: "base64", media_type: match[1], data: match[2] },
+            };
+          }
+        }
+        return { type: "image", source: { type: "url", url } };
+      }
+      return part;
+    });
+  }
+
+  function openAIToAnthropic(body) {
+    const result = {
+      model: body.model,
+      max_tokens: body.max_tokens ?? 4096,
+    };
+
+    if (body.temperature !== undefined) result.temperature = body.temperature;
+    if (body.stream !== undefined) result.stream = body.stream;
+    if (body.stop) {
+      result.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
+    }
+    if (body.thinking_budget) {
+      result.thinking = { type: "enabled", budget_tokens: body.thinking_budget };
+    }
+
+    const msgs = body.messages ?? [];
+    const systemMsgs = msgs.filter((m) => m.role === "system");
+    const otherMsgs = msgs.filter((m) => m.role !== "system");
+
+    if (systemMsgs.length > 0) {
+      result.system = systemMsgs
+        .map((m) =>
+          typeof m.content === "string"
+            ? m.content
+            : (m.content ?? []).map((p) => p.text ?? "").join("")
+        )
+        .join("\n");
+    }
+
+    const anthropicMessages = [];
+    for (const msg of otherMsgs) {
+      if (msg.role === "tool") {
+        const toolResult = {
+          type: "tool_result",
+          tool_use_id: msg.tool_call_id,
+          content: msg.content ?? "",
+        };
+        const last = anthropicMessages[anthropicMessages.length - 1];
+        if (last?.role === "user" && Array.isArray(last.content)) {
+          last.content.push(toolResult);
+        } else {
+          anthropicMessages.push({ role: "user", content: [toolResult] });
+        }
+        continue;
+      }
+
+      if (msg.role === "assistant") {
+        const blocks = [];
+        if (msg.content) blocks.push({ type: "text", text: msg.content });
+        for (const tc of msg.tool_calls ?? []) {
+          let args = {};
+          try {
+            args = JSON.parse(tc.function.arguments);
+          } catch {}
+          blocks.push({ type: "tool_use", id: tc.id, name: tc.function.name, input: args });
+        }
+        anthropicMessages.push({
+          role: "assistant",
+          content: blocks.length === 1 && blocks[0].type === "text" ? blocks[0].text : blocks,
+        });
+        continue;
+      }
+
+      anthropicMessages.push({ role: "user", content: convertContentToAnthropic(msg.content) });
+    }
+
+    result.messages = anthropicMessages;
+
+    const tools = (body.tools ?? []).filter((t) => t.type === "function");
+    if (tools.length > 0) {
+      result.tools = tools.map((t) => ({
+        name: t.function.name,
+        description: t.function.description,
+        input_schema: t.function.parameters ?? { type: "object", properties: {} },
+      }));
+
+      const tc = body.tool_choice;
+      if (tc && tc !== "none") {
+        if (tc === "auto" || tc?.type === "auto") {
+          result.tool_choice = { type: "auto" };
+        } else if (tc === "required" || tc?.type === "required") {
+          result.tool_choice = { type: "any" };
+        } else if (tc?.type === "function") {
+          result.tool_choice = { type: "tool", name: tc.function.name };
+        }
+      }
+    }
+
+    return result;
+  }
+
+  function anthropicToOpenAI(anthropicResp) {
+    const content = anthropicResp.content ?? [];
+    const textBlocks = content.filter((b) => b.type === "text");
+    const toolBlocks = content.filter((b) => b.type === "tool_use");
+
+    const STOP_REASON_MAP = {
+      end_turn: "stop",
+      max_tokens: "length",
+      tool_use: "tool_calls",
+      stop_sequence: "stop",
+    };
+
+    const message = {
+      role: "assistant",
+      content: textBlocks.map((b) => b.text).join("") || null,
+    };
+    if (toolBlocks.length > 0) {
+      message.tool_calls = toolBlocks.map((b, i) => ({
+        index: i,
+        id: b.id,
+        type: "function",
+        function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
+      }));
+    }
+
+    return {
+      id: anthropicResp.id ?? "unknown",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: anthropicResp.model ?? "",
+      choices: [{ index: 0, message, finish_reason: STOP_REASON_MAP[anthropicResp.stop_reason] ?? "stop" }],
+      usage: {
+        prompt_tokens: anthropicResp.usage?.input_tokens ?? 0,
+        completion_tokens: anthropicResp.usage?.output_tokens ?? 0,
+        total_tokens: (anthropicResp.usage?.input_tokens ?? 0) + (anthropicResp.usage?.output_tokens ?? 0),
+      },
+    };
+  }
+
+  function createSSETranslator(model) {
+    let buffer = "";
+    let msgId = null;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    const blockTypes = {};
+    const blockIndexToToolIndex = {};
+    let nextToolIndex = 0;
+
+    const STOP_REASON_MAP = {
+      end_turn: "stop",
+      max_tokens: "length",
+      tool_use: "tool_calls",
+      stop_sequence: "stop",
+    };
+
+    function makeChunk(delta, finishReason, usage) {
+      const obj = {
+        id: msgId ?? "unknown",
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
+      };
+      if (usage) obj.usage = usage;
+      return `data: ${JSON.stringify(obj)}\n\n`;
+    }
+
+    function handleEvent(eventType, data) {
+      try {
+        const ev = JSON.parse(data);
+        const type = eventType ?? ev.type;
+        switch (type) {
+          case "message_start":
+            msgId = ev.message?.id;
+            inputTokens = ev.message?.usage?.input_tokens ?? 0;
+            return makeChunk({ role: "assistant", content: "" }, null, null);
+
+          case "content_block_start": {
+            const idx = ev.index ?? 0;
+            blockTypes[idx] = ev.content_block?.type;
+            if (ev.content_block?.type === "tool_use") {
+              const toolIdx = nextToolIndex++;
+              blockIndexToToolIndex[idx] = toolIdx;
+              return makeChunk(
+                {
+                  tool_calls: [{
+                    index: toolIdx,
+                    id: ev.content_block.id,
+                    type: "function",
+                    function: { name: ev.content_block.name, arguments: "" },
+                  }],
+                },
+                null,
+                null,
+              );
+            }
+            return "";
+          }
+
+          case "content_block_delta": {
+            const idx = ev.index ?? 0;
+            const delta = ev.delta;
+            if (delta?.type === "text_delta") {
+              return makeChunk({ content: delta.text ?? "" }, null, null);
+            }
+            if (delta?.type === "input_json_delta") {
+              const toolIdx = blockIndexToToolIndex[idx] ?? 0;
+              return makeChunk(
+                { tool_calls: [{ index: toolIdx, function: { arguments: delta.partial_json ?? "" } }] },
+                null,
+                null,
+              );
+            }
+            return "";
+          }
+
+          case "content_block_stop":
+            return "";
+
+          case "message_delta":
+            outputTokens = ev.usage?.output_tokens ?? 0;
+            return makeChunk(
+              {},
+              STOP_REASON_MAP[ev.delta?.stop_reason] ?? "stop",
+              {
+                prompt_tokens: inputTokens,
+                completion_tokens: outputTokens,
+                total_tokens: inputTokens + outputTokens,
+              },
+            );
+
+          case "message_stop":
+            return "data: [DONE]\n\n";
+
+          default:
+            return "";
+        }
+      } catch {
+        return "";
+      }
+    }
+
+    function parseBlock(block) {
+      if (!block.trim()) return "";
+      let eventType = null;
+      let dataLine = null;
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event: ")) eventType = line.slice(7).trim();
+        else if (line.startsWith("data: ")) dataLine = line.slice(6);
+      }
+      return dataLine !== null ? handleEvent(eventType, dataLine) : "";
+    }
+
+    return {
+      processChunk(text) {
+        buffer += text;
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() ?? "";
+        return blocks.map(parseBlock).join("");
+      },
+      flush() {
+        return buffer.trim() ? parseBlock(buffer) : "";
+      },
+    };
+  }
+
+  function translateStreamResponse(anthropicResponse, model) {
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    const translator = createSSETranslator(model);
+
+    return new Response(
+      anthropicResponse.body.pipeThrough(
+        new TransformStream({
+          transform(chunk, controller) {
+            const out = translator.processChunk(decoder.decode(chunk, { stream: true }));
+            if (out) controller.enqueue(encoder.encode(out));
+          },
+          flush(controller) {
+            const out = translator.flush();
+            if (out) controller.enqueue(encoder.encode(out));
+          },
+        }),
+      ),
+      { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } },
+    );
+  }
+
+  async function translateAndFetch(chatCompletionsUrl, headers, openAIBody) {
+    const messagesUrl = chatCompletionsUrl.replace(/\/chat\/completions(\?.*)?$/, "/v1/messages$1");
+    const anthropicBody = openAIToAnthropic(openAIBody);
+
+    const response = await fetch(messagesUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(anthropicBody),
+    });
+
+    if (!response.ok) return response;
+
+    if (anthropicBody.stream) return translateStreamResponse(response, openAIBody.model);
+
+    const data = await response.json();
+    return new Response(JSON.stringify(anthropicToOpenAI(data)), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   return {
     provider: {
       id: "github-copilot",
@@ -343,6 +682,19 @@ export async function CopilotAuthPlugin(input = {}) {
 
             const { isVision, isAgent } = getConversationMetadata(init);
             const headers = buildHeaders(init, auth, isVision, isAgent);
+
+            // Route Claude models with /v1/messages support to the native Anthropic endpoint
+            const url = input instanceof Request ? input.url : String(input);
+            const pathname = (() => { try { return new URL(url).pathname; } catch { return url; } })();
+            if (pathname.endsWith("/chat/completions") && init?.body && messagesEndpointModels.size > 0) {
+              let body;
+              try {
+                body = typeof init.body === "string" ? JSON.parse(init.body) : init.body;
+              } catch {}
+              if (body?.model && messagesEndpointModels.has(body.model)) {
+                return translateAndFetch(url, headers, body);
+              }
+            }
 
             return fetch(input, {
               ...init,
