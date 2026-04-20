@@ -40,6 +40,10 @@ export async function CopilotAuthPlugin({ client } = {}) {
   let _cachedToken = null;
   let _cachedTokenExpiry = 0;
 
+  // chat.params doesn't expose variant, so we capture it in chat.message (which fires
+  // first) and look it up by messageID when chat.params runs.
+  const _variantByMessageId = new Map();
+
   function normalizeDomain(url) {
     return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
   }
@@ -933,12 +937,20 @@ export async function CopilotAuthPlugin({ client } = {}) {
         },
       ],
     },
+    "chat.message": async (input) => {
+      if (input.messageID && input.variant) {
+        _variantByMessageId.set(input.messageID, input.variant);
+      }
+    },
     "chat.params": async (input, output) => {
       if (input.model.providerID !== "github-copilot") return;
       if (input.model.api?.npm !== "@ai-sdk/github-copilot") return;
       if (!input.model.id.includes("claude")) return;
 
-      const thinkingBudget = resolveClaudeThinkingBudget(input.model, input.message.variant);
+      const variant = _variantByMessageId.get(input.message.id);
+      _variantByMessageId.delete(input.message.id);
+
+      const thinkingBudget = resolveClaudeThinkingBudget(input.model, variant);
       if (thinkingBudget === undefined) return;
 
       output.options.thinking_budget = thinkingBudget;
