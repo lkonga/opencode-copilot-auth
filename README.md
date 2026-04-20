@@ -1,8 +1,8 @@
-# opencode-copilot-cli-auth
+# opencode-copilot-auth
 
 Package on npm: https://www.npmjs.com/package/@zhzy0077/opencode-copilot-cli-auth
 
-This fork replaces the older GitHub Copilot chat-auth flow with the newer Copilot CLI-style OAuth flow and makes `opencode` use the live Copilot model metadata for your account.
+A fork of [anomalyco/opencode-copilot-auth](https://github.com/anomalyco/opencode-copilot-auth) that adds native **1M token context** for Claude models by routing requests through the Anthropic Messages API (`/v1/messages`) instead of the OpenAI-compatible `/chat/completions` endpoint.
 
 ## How to use
 
@@ -12,12 +12,12 @@ Add the plugin to your `opencode` config:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@zhzy0077/opencode-copilot-cli-auth@0.0.19"
+    "@zhzy0077/opencode-copilot-cli-auth@0.0.22"
   ]
 }
 ```
 
-Then start `opencode` and log in to the `github-copilot` provider. The plugin handles the Copilot CLI-style device flow and will reuse the stored GitHub OAuth token afterward.
+Then start `opencode` and log in to the `github-copilot` provider using the device flow.
 
 For local development before publishing, you can load the file directly:
 
@@ -30,70 +30,46 @@ For local development before publishing, you can load the file directly:
 }
 ```
 
-Important: if the file path contains `opencode-copilot-auth`, current `opencode` builds may skip loading it because of a hardcoded plugin-name filter. Use a path that does not contain that substring.
+> **Note:** if the file path contains `opencode-copilot-auth`, current `opencode` builds may skip loading it due to a hardcoded plugin-name filter. Use a path that does not contain that substring.
 
-## What changed in this fork
+## What this fork adds over upstream
 
-- Auth flow: uses the Copilot CLI-style OAuth client flow and keeps the GitHub OAuth token directly.
-- Entitlement: fetches `/copilot_internal/user` and uses the entitlement-provided Copilot API base URL.
-- Token exchange: does not call `/copilot_internal/v2/token`.
-- Request profile: uses the newer `copilot-developer-cli` headers instead of the older chat profile.
-- Model metadata: fetches the live Copilot `/models` response via the plugin `provider.models` hook so the final `opencode` model list comes from the entitlement-backed Copilot API.
+### 1M context for Claude models
 
-## Context window and model limits
+The Copilot API exposes a native Anthropic Messages endpoint at `/v1/messages` that accepts up to **1,000,000 tokens** — far beyond the 168K hard cap on `/chat/completions`. This fork automatically routes all Claude model requests to that endpoint and translates the request/response format transparently.
 
-The main practical difference from upstream is that this fork patches live per-model limits from Copilot instead of relying only on static metadata.
+The Copilot API metadata reports `max_context_window_tokens: 200000` for most Claude models. This fork overrides those values to `1,000,000` for any model that supports `/v1/messages`, so `opencode` sends the correct window size.
 
-That means `opencode` can see the Copilot-advertised values for:
+Empirically verified (needle-in-haystack tests):
+- `claude-opus-4.7`: 350K tokens ✓, 1M tokens ✓, 1.44M tokens ✗ (confirmed 1M ceiling)
+- `claude-sonnet-4.6`: 302K tokens ✓ (secret retrieved correctly)
 
-- `limit.context`
-- `limit.input`
-- `limit.output`
+### More models (20 vs upstream's baseline)
 
-As of March 10, 2026, the live GitHub Copilot `/models` response used by this
-fork exposes the Copilot CLI model profile. The table below compares the live
-Copilot CLI context window against the static `github-copilot` catalog on
-[`models.dev`](https://models.dev).
+Uses the VSCode OAuth client (`Iv1.b507a08c87ecfe98`) and `api.githubcopilot.com`, which exposes 20 picker models including `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gpt-4o` that the enterprise endpoint omits.
 
-| Model               | This Fork (CLI Context) | `models.dev` Context | Difference |
-| ------------------- | ----------------------: | -------------------: | ---------: |
-| `claude-opus-4.6`   |                 200,000 |              128,000 |    +72,000 |
-| `claude-sonnet-4.6` |                 200,000 |              128,000 |    +72,000 |
-| `claude-haiku-4.5`  |                 144,000 |              128,000 |    +16,000 |
+### Persistent token caching
 
-The practical takeaway is that this fork exposes larger live Claude context
-windows than the static `models.dev` values.
+The short-lived Copilot token (exchanged via `/copilot_internal/v2/token`) is written back to the `opencode` auth store with a 5-minute expiry buffer. When you run multiple `opencode` instances simultaneously, only the first one fetches a new token — the rest reuse the persisted one.
 
-Examples observed with this fork:
+## Model limits exposed to opencode
 
-- `claude-sonnet-4.6`
-  - context window: `200000`
-  - prompt/input limit: `168000`
-  - output limit: `32000`
-- `claude-opus-4.6`
-  - context window: `200000`
-  - prompt/input limit: `168000`
-  - output limit: `64000`
-- `claude-haiku-4.5`
-  - context window: `144000`
-  - prompt/input limit: `128000`
-  - output limit: `32000`
+| Model                | Context    | Input (prompt) | Output |
+|----------------------|-----------:|---------------:|-------:|
+| `claude-opus-4.7`    | 1,000,000  | 1,000,000      | 32,000 |
+| `claude-opus-4.6`    | 1,000,000  | 1,000,000      | 32,000 |
+| `claude-opus-4.6-1m` | 1,000,000  | 936,000        | 64,000 |
+| `claude-sonnet-4.6`  | 1,000,000  | 1,000,000      | 32,000 |
+| `claude-sonnet-4.5`  | 1,000,000  | 1,000,000      | 32,000 |
+| `claude-haiku-4.5`   | 1,000,000  | 1,000,000      | 64,000 |
 
-Without this patching, `opencode` may show stale or smaller limits depending on the static model catalog it started from.
+## Claude thinking budget
 
-## Claude thinking budget behavior
-
-This fork also changes Copilot Claude request behavior:
-
-- when the `thinking` variant is selected, it sends `thinking_budget: 16000`
-- when no variant is selected, it omits `thinking_budget` entirely
-
-This differs from upstream `opencode`, which currently sends `thinking_budget: 4000` for the built-in `thinking` variant.
-
-The plugin intentionally does not try to change the `opencode` core UI. So the visible Claude variant list is still controlled by `opencode` itself; this fork changes the request behavior, not the built-in variant picker labels.
+When the `thinking` variant is selected, the plugin sends `thinking_budget: 16000`. When no variant is selected, it omits the field entirely.
 
 ## Publishing
 
 ```zsh
 ./script/publish.ts
 ```
+
