@@ -428,13 +428,9 @@ export async function CopilotAuthPlugin({ client } = {}) {
     }
 
     // reasoning_effort comes from the @ai-sdk/github-copilot reasoningEffort variant option.
-    // "max" uses all available tokens for thinking (budget = max_tokens - 1).
-    const REASONING_EFFORT_BUDGETS = { low: 4000, medium: 8000, high: 16000, xhigh: 31999 };
-    const effort = body.reasoning_effort;
-    const effortBudget =
-      effort === "max"
-        ? result.max_tokens - 1
-        : REASONING_EFFORT_BUDGETS[effort];
+    // Budgets align with official Anthropic SDK: high=16000, max=31999.
+    const REASONING_EFFORT_BUDGETS = { low: 1024, medium: 8000, high: 16000, xhigh: 24000, max: 31999 };
+    const effortBudget = REASONING_EFFORT_BUDGETS[body.reasoning_effort];
     if (effortBudget !== undefined) {
       result.thinking = { type: "enabled", budget_tokens: effortBudget };
       // Anthropic requires temperature=1 when thinking is enabled
