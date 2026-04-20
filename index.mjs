@@ -1,7 +1,7 @@
 /**
  * @type {import("@opencode-ai/plugin").Plugin}
  */
-export async function CopilotAuthPlugin(input = {}) {
+export async function CopilotAuthPlugin({ client } = {}) {
   const CLIENT_ID = "Iv1.b507a08c87ecfe98";
   const API_VERSION = "2025-05-01";
   const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000;
@@ -35,10 +35,10 @@ export async function CopilotAuthPlugin(input = {}) {
     "Copilot-Integration-Id": "vscode-chat",
   };
 
-  // Short-lived Copilot token cache (expires every ~30 min)
-  let _copilotToken = null;
-  let _copilotTokenExpiry = 0;
-  let _copilotTokenSource = null;
+  // Short-lived Copilot token — persisted to auth store (5-min buffer before expiry).
+  // In-memory fallback covers the window between auth store writes.
+  let _cachedToken = null;
+  let _cachedTokenExpiry = 0;
 
   function normalizeDomain(url) {
     return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
@@ -83,10 +83,19 @@ export async function CopilotAuthPlugin(input = {}) {
 
   async function getCopilotToken(info) {
     const now = Date.now();
-    if (_copilotToken && _copilotTokenSource === info.refresh && _copilotTokenExpiry > now + 60_000) {
-      return _copilotToken;
+    const BUFFER_MS = 5 * 60 * 1000; // 5-minute buffer matching upstream
+
+    // Level 1: auth store (persisted across restarts — shared by all opencode instances)
+    if (info.access && info.expires && info.expires - BUFFER_MS > now) {
+      return info.access;
     }
 
+    // Level 2: in-memory (avoids redundant auth store reads within same instance)
+    if (_cachedToken && _cachedTokenExpiry - BUFFER_MS > now) {
+      return _cachedToken;
+    }
+
+    // Level 3: fetch from GitHub API
     const domain = info.enterpriseUrl ? normalizeDomain(info.enterpriseUrl) : "github.com";
     const apiDomain = domain === "github.com" ? "api.github.com" : `api.${domain}`;
 
@@ -103,10 +112,25 @@ export async function CopilotAuthPlugin(input = {}) {
     }
 
     const data = await response.json();
-    _copilotToken = data.token;
-    _copilotTokenExpiry = (data.expires_at ?? 0) * 1000;
-    _copilotTokenSource = info.refresh;
-    return _copilotToken;
+    _cachedToken = data.token;
+    _cachedTokenExpiry = data.expires_at * 1000;
+
+    // Persist to auth store so other instances skip the HTTP call
+    if (client?.auth?.set) {
+      const providerID = info.enterpriseUrl ? "github-copilot-enterprise" : "github-copilot";
+      await client.auth.set({
+        path: { id: providerID },
+        body: {
+          type: "oauth",
+          refresh: info.refresh,
+          access: data.token,
+          expires: _cachedTokenExpiry - BUFFER_MS,
+          ...(info.enterpriseUrl && { enterpriseUrl: info.enterpriseUrl }),
+        },
+      }).catch(() => {}); // non-fatal
+    }
+
+    return _cachedToken;
   }
 
   async function fetchModels(copilotToken, baseURL) {
@@ -932,7 +956,7 @@ export async function CopilotAuthPlugin(input = {}) {
             messageID: incoming.message.id,
           },
           query: {
-            directory: input.directory,
+            directory: incoming.directory,
           },
           throwOnError: true,
         })
@@ -949,7 +973,7 @@ export async function CopilotAuthPlugin(input = {}) {
             id: incoming.sessionID,
           },
           query: {
-            directory: input.directory,
+            directory: incoming.directory,
           },
           throwOnError: true,
         })
