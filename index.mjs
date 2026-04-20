@@ -214,13 +214,13 @@ export async function CopilotAuthPlugin({ client } = {}) {
       cost: zeroCost(),
       limit: {
         context:
-          limits.max_context_window_tokens
-          ?? existing?.limit?.context
-          ?? 0,
+          messagesEndpointModels.has(live.id)
+            ? 1_000_000
+            : (limits.max_context_window_tokens ?? existing?.limit?.context ?? 0),
         input:
-          limits.max_prompt_tokens
-          ?? existing?.limit?.input
-          ?? limits.max_context_window_tokens,
+          messagesEndpointModels.has(live.id)
+            ? 1_000_000
+            : (limits.max_prompt_tokens ?? existing?.limit?.input ?? limits.max_context_window_tokens),
         output:
           limits.max_output_tokens
           ?? limits.max_non_streaming_output_tokens
